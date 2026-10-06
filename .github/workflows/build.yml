@@ -1,0 +1,749 @@
+name: Build KeyMacro Mod (Fabric 1.21.10)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.1.0
+
+      - name: Generate mod project
+        run: |
+          set -euo pipefail
+          MC=1.21.10
+
+          YARN=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/yarn/${MC}" | jq -r '.[0].version') || true
+          LOADER=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/loader" | jq -r '[.[] | select(.stable == true)][0].version') || true
+          FAPI=$(curl -fsSL "https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml" | grep -o "<version>[^<]*+${MC}</version>" | sed -e 's/<version>//' -e 's/<\/version>//' | tail -n 1) || true
+
+          echo "Yarn   : ${YARN}"
+          echo "Loader : ${LOADER}"
+          echo "FabricAPI: ${FAPI}"
+
+          if [ -z "${YARN}" ] || [ "${YARN}" = "null" ]; then echo "Yarn version tidak ketemu"; exit 1; fi
+          if [ -z "${LOADER}" ] || [ "${LOADER}" = "null" ]; then echo "Loader version tidak ketemu"; exit 1; fi
+          if [ -z "${FAPI}" ]; then echo "Fabric API version tidak ketemu"; exit 1; fi
+
+          mkdir -p mod
+          cd mod
+
+          printf '%s\n' \
+            "org.gradle.jvmargs=-Xmx2G" \
+            "org.gradle.parallel=true" \
+            "minecraft_version=${MC}" \
+            "yarn_mappings=${YARN}" \
+            "loader_version=${LOADER}" \
+            "fabric_version=${FAPI}" \
+            > gradle.properties
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'keymacro'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.12-SNAPSHOT'
+          }
+
+          base {
+              archivesName = 'keymacro'
+          }
+
+          version = '1.0.0'
+          group = 'com.example.keymacro'
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              options.release = 21
+              options.encoding = 'UTF-8'
+          }
+
+          java {
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          mkdir -p src/main/resources
+          mkdir -p src/main/java/com/example/keymacro
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "keymacro",
+            "version": "1.0.0",
+            "name": "Key Macro",
+            "description": "Mapping tombol macro lewat GUI (/macro). Tahan tombol = jalanin urutan slot hotbar + klik.",
+            "authors": ["You"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.keymacro.KeyMacroClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "1.21.10",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/java/com/example/keymacro/KeyMacroClient.java <<'EOF'
+          package com.example.keymacro;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
+          import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+
+          public class KeyMacroClient implements ClientModInitializer {
+              // Flag: GUI dibuka di tick berikutnya (biar nggak ketutup sama chat screen)
+              private static boolean openRequested = false;
+
+              @Override
+              public void onInitializeClient() {
+                  MacroConfig.load();
+
+                  ClientCommandRegistrationCallback.EVENT.register((dispatcher, registryAccess) ->
+                      dispatcher.register(ClientCommandManager.literal("macro").executes(context -> {
+                          openRequested = true;
+                          return 1;
+                      }))
+                  );
+
+                  ClientTickEvents.START_CLIENT_TICK.register(client -> {
+                      if (openRequested) {
+                          openRequested = false;
+                          client.setScreen(new MacroScreen());
+                          return;
+                      }
+                      MacroRunner.tick(client);
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/keymacro/MacroEntry.java <<'EOF'
+          package com.example.keymacro;
+
+          import java.util.Arrays;
+
+          public class MacroEntry {
+              public static final int STEP_COUNT = 6;
+
+              // -1 = kosong, 0..999 = keyboard (kode GLFW), 1000+ = tombol mouse (1000 = kiri, 1001 = kanan, 1002 = tengah, dst)
+              public int key = -1;
+              public int[] steps = emptySteps();
+              public int delayMs = 100;
+              public boolean enabled = true;
+
+              public transient int stepIndex = 0;
+              public transient int waitLeft = 0;
+
+              public static int[] emptySteps() {
+                  int[] a = new int[STEP_COUNT];
+                  Arrays.fill(a, -1);
+                  return a;
+              }
+
+              public void normalize() {
+                  int[] fixed = emptySteps();
+                  if (steps != null) {
+                      System.arraycopy(steps, 0, fixed, 0, Math.min(steps.length, STEP_COUNT));
+                  }
+                  steps = fixed;
+                  if (delayMs < 0) {
+                      delayMs = 0;
+                  }
+              }
+
+              // Urutan langkah yang terisi (kotak kosong dilewati)
+              public int[] activeSteps() {
+                  int n = 0;
+                  for (int s : steps) {
+                      if (s >= 0) {
+                          n++;
+                      }
+                  }
+                  int[] out = new int[n];
+                  int i = 0;
+                  for (int s : steps) {
+                      if (s >= 0) {
+                          out[i++] = s;
+                      }
+                  }
+                  return out;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/keymacro/MacroConfig.java <<'EOF'
+          package com.example.keymacro;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import java.io.IOException;
+          import java.io.Reader;
+          import java.io.Writer;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          public final class MacroConfig {
+              public static final List<MacroEntry> MACROS = new ArrayList<>();
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              private MacroConfig() {
+              }
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("keymacro.json");
+              }
+
+              public static void load() {
+                  MACROS.clear();
+                  Path p = file();
+                  if (!Files.exists(p)) {
+                      return;
+                  }
+                  try (Reader r = Files.newBufferedReader(p)) {
+                      MacroEntry[] arr = GSON.fromJson(r, MacroEntry[].class);
+                      if (arr != null) {
+                          for (MacroEntry e : arr) {
+                              if (e != null) {
+                                  e.normalize();
+                                  MACROS.add(e);
+                              }
+                          }
+                      }
+                  } catch (Exception e) {
+                      System.err.println("[KeyMacro] Gagal load config: " + e);
+                  }
+              }
+
+              public static void save() {
+                  try {
+                      Path p = file();
+                      Files.createDirectories(p.getParent());
+                      try (Writer w = Files.newBufferedWriter(p)) {
+                          GSON.toJson(MACROS.toArray(new MacroEntry[0]), MacroEntry[].class, w);
+                      }
+                  } catch (IOException | RuntimeException e) {
+                      System.err.println("[KeyMacro] Gagal save config: " + e);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/keymacro/MacroKeys.java <<'EOF'
+          package com.example.keymacro;
+
+          import java.util.HashMap;
+          import java.util.Map;
+          import org.lwjgl.glfw.GLFW;
+
+          public final class MacroKeys {
+              public static final int MOUSE_BASE = 1000;
+              private static final Map<Integer, String> NAMES = new HashMap<>();
+              private static final Map<Integer, String> SHORT = new HashMap<>();
+
+              private static void reg(int code, String full, String shortName) {
+                  NAMES.put(code, full);
+                  SHORT.put(code, shortName);
+              }
+
+              static {
+                  reg(GLFW.GLFW_KEY_SPACE, "Space", "Spc");
+                  reg(GLFW.GLFW_KEY_ENTER, "Enter", "Ent");
+                  reg(GLFW.GLFW_KEY_TAB, "Tab", "Tab");
+                  reg(GLFW.GLFW_KEY_BACKSPACE, "Backspace", "Bksp");
+                  reg(GLFW.GLFW_KEY_INSERT, "Insert", "Ins");
+                  reg(GLFW.GLFW_KEY_DELETE, "Delete", "Del");
+                  reg(GLFW.GLFW_KEY_RIGHT, "Panah Kanan", "Right");
+                  reg(GLFW.GLFW_KEY_LEFT, "Panah Kiri", "Left");
+                  reg(GLFW.GLFW_KEY_DOWN, "Panah Bawah", "Down");
+                  reg(GLFW.GLFW_KEY_UP, "Panah Atas", "Up");
+                  reg(GLFW.GLFW_KEY_PAGE_UP, "Page Up", "PgUp");
+                  reg(GLFW.GLFW_KEY_PAGE_DOWN, "Page Down", "PgDn");
+                  reg(GLFW.GLFW_KEY_HOME, "Home", "Home");
+                  reg(GLFW.GLFW_KEY_END, "End", "End");
+                  reg(GLFW.GLFW_KEY_CAPS_LOCK, "Caps Lock", "Caps");
+                  reg(GLFW.GLFW_KEY_LEFT_SHIFT, "L-Shift", "LShft");
+                  reg(GLFW.GLFW_KEY_RIGHT_SHIFT, "R-Shift", "RShft");
+                  reg(GLFW.GLFW_KEY_LEFT_CONTROL, "L-Ctrl", "LCtrl");
+                  reg(GLFW.GLFW_KEY_RIGHT_CONTROL, "R-Ctrl", "RCtrl");
+                  reg(GLFW.GLFW_KEY_LEFT_ALT, "L-Alt", "LAlt");
+                  reg(GLFW.GLFW_KEY_RIGHT_ALT, "R-Alt", "RAlt");
+              }
+
+              private MacroKeys() {
+              }
+
+              public static boolean isDown(long window, int code) {
+                  if (code < 0) {
+                      return false;
+                  }
+                  if (code >= MOUSE_BASE) {
+                      return GLFW.glfwGetMouseButton(window, code - MOUSE_BASE) == GLFW.GLFW_PRESS;
+                  }
+                  return GLFW.glfwGetKey(window, code) == GLFW.GLFW_PRESS;
+              }
+
+              public static String name(int code) {
+                  if (code < 0) {
+                      return "Belum diatur";
+                  }
+                  if (code >= MOUSE_BASE) {
+                      int b = code - MOUSE_BASE;
+                      if (b == 0) {
+                          return "Klik Kiri";
+                      }
+                      if (b == 1) {
+                          return "Klik Kanan";
+                      }
+                      if (b == 2) {
+                          return "Mouse Tengah";
+                      }
+                      return "Mouse " + (b + 1);
+                  }
+                  String known = NAMES.get(code);
+                  if (known != null) {
+                      return known;
+                  }
+                  if (code >= GLFW.GLFW_KEY_F1 && code <= GLFW.GLFW_KEY_F25) {
+                      return "F" + (code - GLFW.GLFW_KEY_F1 + 1);
+                  }
+                  String n = GLFW.glfwGetKeyName(code, 0);
+                  if (n != null && !n.isEmpty()) {
+                      return n.toUpperCase();
+                  }
+                  return "Key " + code;
+              }
+
+              // Nama pendek buat kotak kecil
+              public static String shortName(int code) {
+                  if (code < 0) {
+                      return "-";
+                  }
+                  if (code >= MOUSE_BASE) {
+                      int b = code - MOUSE_BASE;
+                      if (b == 0) {
+                          return "LMB";
+                      }
+                      if (b == 1) {
+                          return "RMB";
+                      }
+                      if (b == 2) {
+                          return "MMB";
+                      }
+                      return "M" + (b + 1);
+                  }
+                  String s = SHORT.get(code);
+                  if (s != null) {
+                      return s;
+                  }
+                  String n = name(code);
+                  return n.length() > 5 ? n.substring(0, 5) : n;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/keymacro/MacroRunner.java <<'EOF'
+          package com.example.keymacro;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import org.lwjgl.glfw.GLFW;
+
+          public final class MacroRunner {
+              private MacroRunner() {
+              }
+
+              public static void tick(MinecraftClient client) {
+                  // Nggak jalan kalau lagi ada layar (chat, inventory, menu, GUI macro, dll)
+                  if (client.player == null || client.world == null || client.currentScreen != null) {
+                      resetAll();
+                      return;
+                  }
+                  long window = GLFW.glfwGetCurrentContext();
+                  if (window == 0L) {
+                      return;
+                  }
+                  for (MacroEntry m : MacroConfig.MACROS) {
+                      if (!m.enabled || m.key < 0 || !MacroKeys.isDown(window, m.key)) {
+                          m.stepIndex = 0;
+                          m.waitLeft = 0;
+                          continue;
+                      }
+                      step(m);
+                  }
+              }
+
+              private static void resetAll() {
+                  for (MacroEntry m : MacroConfig.MACROS) {
+                      m.stepIndex = 0;
+                      m.waitLeft = 0;
+                  }
+              }
+
+              private static void step(MacroEntry m) {
+                  int[] seq = m.activeSteps();
+                  if (seq.length == 0) {
+                      return;
+                  }
+                  if (m.waitLeft > 0) {
+                      m.waitLeft--;
+                      return;
+                  }
+                  if (m.stepIndex >= seq.length) {
+                      m.stepIndex = 0;
+                  }
+                  int code = seq[m.stepIndex];
+                  m.stepIndex = (m.stepIndex + 1) % seq.length;
+                  m.waitLeft = delayTicks(m) - 1;
+                  press(code);
+              }
+
+              private static int delayTicks(MacroEntry m) {
+                  int ms = Math.max(0, Math.min(m.delayMs, 5000));
+                  return Math.max(1, Math.round(ms / 50.0f));
+              }
+
+              // Sama kayak kita mencet tombol itu: game yang nentuin fungsinya (hotbar, klik kanan, dll)
+              private static void press(int code) {
+                  InputUtil.Key key;
+                  if (code >= MacroKeys.MOUSE_BASE) {
+                      key = InputUtil.Type.MOUSE.createFromCode(code - MacroKeys.MOUSE_BASE);
+                  } else {
+                      key = InputUtil.Type.KEYSYM.createFromCode(code);
+                  }
+                  KeyBinding.onKeyPressed(key);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/keymacro/MacroScreen.java <<'EOF'
+          package com.example.keymacro;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.text.Text;
+          import org.lwjgl.glfw.GLFW;
+
+          public class MacroScreen extends Screen {
+              private static final int PER_PAGE = 5;
+              private static final int ROW_W = 390;
+              private static final int ROW_H = 26;
+              private static final int TOP = 44;
+
+              private int page = 0;
+              private int listening = -1;   // index macro yang lagi nunggu input
+              private int listenSlot = -1;  // -1 = kotak tombol pemicu, 0.. = kotak langkah
+              private final boolean[] keySnap = new boolean[GLFW.GLFW_KEY_LAST + 1];
+              private final boolean[] mouseSnap = new boolean[8];
+
+              public MacroScreen() {
+                  super(Text.literal("Key Macro"));
+              }
+
+              @Override
+              protected void init() {
+                  int total = MacroConfig.MACROS.size();
+                  int pages = Math.max(1, (total + PER_PAGE - 1) / PER_PAGE);
+                  if (page >= pages) {
+                      page = pages - 1;
+                  }
+                  if (page < 0) {
+                      page = 0;
+                  }
+
+                  int x0 = this.width / 2 - ROW_W / 2;
+                  int start = page * PER_PAGE;
+
+                  for (int i = 0; i < PER_PAGE; i++) {
+                      int idx = start + i;
+                      if (idx >= total) {
+                          break;
+                      }
+                      MacroEntry m = MacroConfig.MACROS.get(idx);
+                      int fi = idx;
+                      int y = TOP + i * ROW_H;
+
+                      // Kotak tombol pemicu (misal Z)
+                      String keyLabel = (listening == idx && listenSlot < 0) ? "> Tekan <" : MacroKeys.name(m.key);
+                      addDrawableChild(ButtonWidget.builder(Text.literal(keyLabel), b -> toggleListen(fi, -1))
+                          .dimensions(x0, y, 76, 20).build());
+
+                      // Kotak-kotak langkah (hotbar 3, klik kanan, dst)
+                      for (int s = 0; s < MacroEntry.STEP_COUNT; s++) {
+                          int fs = s;
+                          String label = (listening == idx && listenSlot == s) ? "?" : MacroKeys.shortName(m.steps[s]);
+                          addDrawableChild(ButtonWidget.builder(Text.literal(label), b -> toggleListen(fi, fs))
+                              .dimensions(x0 + 80 + s * 36, y, 34, 20).build());
+                      }
+
+                      // Delay antar langkah (ms)
+                      TextFieldWidget delayField = new TextFieldWidget(this.textRenderer, x0 + 298, y, 36, 20, Text.literal("Delay"));
+                      delayField.setMaxLength(4);
+                      delayField.setText(String.valueOf(m.delayMs));
+                      delayField.setChangedListener(s -> {
+                          try {
+                              m.delayMs = Math.max(0, Integer.parseInt(s.trim()));
+                          } catch (NumberFormatException ignored) {
+                              // input belum valid, abaikan
+                          }
+                      });
+                      addDrawableChild(delayField);
+
+                      addDrawableChild(ButtonWidget.builder(Text.literal(m.enabled ? "ON" : "OFF"), b -> {
+                          m.enabled = !m.enabled;
+                          b.setMessage(Text.literal(m.enabled ? "ON" : "OFF"));
+                      }).dimensions(x0 + 338, y, 30, 20).build());
+
+                      addDrawableChild(ButtonWidget.builder(Text.literal("X"), b -> {
+                          MacroConfig.MACROS.remove(m);
+                          listening = -1;
+                          listenSlot = -1;
+                          MacroConfig.save();
+                          rebuild();
+                      }).dimensions(x0 + 372, y, 18, 20).build());
+                  }
+
+                  int yb = TOP + PER_PAGE * ROW_H + 6;
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("+ Tambah Macro"), b -> {
+                      MacroConfig.MACROS.add(new MacroEntry());
+                      page = (MacroConfig.MACROS.size() - 1) / PER_PAGE;
+                      listening = -1;
+                      listenSlot = -1;
+                      rebuild();
+                  }).dimensions(x0, yb, 120, 20).build());
+
+                  ButtonWidget prev = ButtonWidget.builder(Text.literal("<"), b -> {
+                      if (page > 0) {
+                          page--;
+                          listening = -1;
+                          listenSlot = -1;
+                          rebuild();
+                      }
+                  }).dimensions(x0 + 124, yb, 40, 20).build();
+                  prev.active = page > 0;
+                  addDrawableChild(prev);
+
+                  ButtonWidget next = ButtonWidget.builder(Text.literal(">"), b -> {
+                      int p = Math.max(1, (MacroConfig.MACROS.size() + PER_PAGE - 1) / PER_PAGE);
+                      if (page < p - 1) {
+                          page++;
+                          listening = -1;
+                          listenSlot = -1;
+                          rebuild();
+                      }
+                  }).dimensions(x0 + 168, yb, 40, 20).build();
+                  next.active = page < pages - 1;
+                  addDrawableChild(next);
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Selesai"), b -> this.close())
+                      .dimensions(x0 + 212, yb, 178, 20).build());
+              }
+
+              private void rebuild() {
+                  this.setFocused(null);
+                  this.clearChildren();
+                  this.init();
+              }
+
+              private void toggleListen(int index, int slot) {
+                  if (listening == index && listenSlot == slot) {
+                      // Klik kotak yang sama lagi: kotak langkah = Klik Kiri, kotak pemicu = batal
+                      if (slot >= 0 && index < MacroConfig.MACROS.size()) {
+                          MacroConfig.MACROS.get(index).steps[slot] = MacroKeys.MOUSE_BASE;
+                          MacroConfig.save();
+                      }
+                      listening = -1;
+                      listenSlot = -1;
+                  } else {
+                      listening = index;
+                      listenSlot = slot;
+                      takeSnapshot();
+                  }
+                  rebuild();
+              }
+
+              private void assign(int code) {
+                  if (listening >= 0 && listening < MacroConfig.MACROS.size()) {
+                      MacroEntry m = MacroConfig.MACROS.get(listening);
+                      if (listenSlot < 0) {
+                          m.key = code;
+                      } else {
+                          m.steps[listenSlot] = code;
+                      }
+                      MacroConfig.save();
+                  }
+                  listening = -1;
+                  listenSlot = -1;
+                  rebuild();
+              }
+
+              private void takeSnapshot() {
+                  long w = GLFW.glfwGetCurrentContext();
+                  for (int k = GLFW.GLFW_KEY_SPACE; k <= GLFW.GLFW_KEY_LAST; k++) {
+                      keySnap[k] = w != 0L && GLFW.glfwGetKey(w, k) == GLFW.GLFW_PRESS;
+                  }
+                  for (int b = 0; b < mouseSnap.length; b++) {
+                      mouseSnap[b] = w != 0L && GLFW.glfwGetMouseButton(w, b) == GLFW.GLFW_PRESS;
+                  }
+              }
+
+              // Nunggu tombol baru ditekan. Esc = batal, Backspace/Delete = kosongin kotak.
+              private void pollListening() {
+                  if (listening < 0) {
+                      return;
+                  }
+                  if (listening >= MacroConfig.MACROS.size()) {
+                      listening = -1;
+                      listenSlot = -1;
+                      return;
+                  }
+                  long w = GLFW.glfwGetCurrentContext();
+                  if (w == 0L) {
+                      return;
+                  }
+                  int captured = -1;
+                  boolean cancel = false;
+                  boolean clear = false;
+
+                  for (int k = GLFW.GLFW_KEY_SPACE; k <= GLFW.GLFW_KEY_LAST; k++) {
+                      boolean down = GLFW.glfwGetKey(w, k) == GLFW.GLFW_PRESS;
+                      if (down && !keySnap[k]) {
+                          if (k == GLFW.GLFW_KEY_ESCAPE) {
+                              cancel = true;
+                          } else if (k == GLFW.GLFW_KEY_BACKSPACE || k == GLFW.GLFW_KEY_DELETE) {
+                              clear = true;
+                          } else if (captured < 0) {
+                              captured = k;
+                          }
+                      }
+                      keySnap[k] = down;
+                  }
+                  // Klik kiri (0) ditangani lewat klik kotak lagi. Klik kanan boleh buat kotak langkah, bukan buat pemicu.
+                  int firstMouse = listenSlot < 0 ? 2 : 1;
+                  for (int b = firstMouse; b < mouseSnap.length; b++) {
+                      boolean down = GLFW.glfwGetMouseButton(w, b) == GLFW.GLFW_PRESS;
+                      if (down && !mouseSnap[b] && captured < 0) {
+                          captured = MacroKeys.MOUSE_BASE + b;
+                      }
+                      mouseSnap[b] = down;
+                  }
+
+                  if (cancel) {
+                      listening = -1;
+                      listenSlot = -1;
+                      rebuild();
+                  } else if (clear) {
+                      assign(-1);
+                  } else if (captured >= 0) {
+                      assign(captured);
+                  }
+              }
+
+              @Override
+              public boolean shouldCloseOnEsc() {
+                  return listening < 0;
+              }
+
+              @Override
+              public void removed() {
+                  MacroConfig.save();
+              }
+
+              private void drawCentered(DrawContext context, String s, int y, int color) {
+                  Text t = Text.literal(s);
+                  int w = this.textRenderer.getWidth(t);
+                  context.drawTextWithShadow(this.textRenderer, t, this.width / 2 - w / 2, y, color);
+              }
+
+              private void drawAt(DrawContext context, String s, int x, int y, int color) {
+                  context.drawTextWithShadow(this.textRenderer, Text.literal(s), x, y, color);
+              }
+
+              @Override
+              public void render(DrawContext context, int mouseX, int mouseY, float delta) {
+                  pollListening();
+                  super.render(context, mouseX, mouseY, delta);
+
+                  int total = MacroConfig.MACROS.size();
+                  int pages = Math.max(1, (total + PER_PAGE - 1) / PER_PAGE);
+                  int yb = TOP + PER_PAGE * ROW_H + 6;
+                  int x0 = this.width / 2 - ROW_W / 2;
+
+                  drawCentered(context, "Key Macro", 8, 0xFFFFFFFF);
+                  drawCentered(context, "Tahan tombol pemicu buat jalanin urutan langkah (nggak aktif pas ngetik / GUI kebuka)", 20, 0xFFAAAAAA);
+
+                  drawAt(context, "Tombol", x0 + 2, TOP - 12, 0xFFAAAAAA);
+                  drawAt(context, "Langkah 1 > 6 (urut)", x0 + 82, TOP - 12, 0xFFAAAAAA);
+                  drawAt(context, "Delay", x0 + 300, TOP - 12, 0xFFAAAAAA);
+
+                  if (total == 0) {
+                      drawCentered(context, "Belum ada macro. Klik '+ Tambah Macro'.", TOP + 10, 0xFFFFFFFF);
+                  }
+                  if (listening >= 0) {
+                      String hint = listenSlot < 0
+                          ? "Tekan tombol pemicu (keyboard / mouse tengah-samping). Esc = batal"
+                          : "Tekan tombol (3, klik kanan, dll). Klik kotak lagi = klik kiri. Esc = batal";
+                      drawCentered(context, hint, yb + 24, 0xFFFFFF55);
+                  } else {
+                      drawCentered(context, "Halaman " + (page + 1) + "/" + pages + "  |  Total macro: " + total, yb + 24, 0xFFAAAAAA);
+                  }
+                  drawCentered(context, "Klik kotak lalu tekan tombol, kayak ngubah keybind. Backspace = kosongin kotak.", yb + 36, 0xFFAAAAAA);
+                  drawCentered(context, "Delay = jeda antar langkah (ms). Contoh anchor: 3, RMB, 4, RMB, 3, RMB", yb + 48, 0xFFAAAAAA);
+              }
+          }
+          EOF
+
+          echo "Struktur project:"
+          find . -type f | sort
+
+      - name: Build
+        working-directory: mod
+        run: gradle build --no-daemon --stacktrace
+
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: KeyMacro-1.21.10
+          path: mod/build/libs/keymacro-1.0.0.jar
+          if-no-files-found: error
