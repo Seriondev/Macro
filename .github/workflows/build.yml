@@ -1,12 +1,19 @@
-name: Build KeyMacro Mod (Fabric 1.21.10)
+name: Build KeyMacro Mod (Fabric 1.21.10 + 1.21.11)
 
 on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mc: ["1.21.10", "1.21.11"]
     steps:
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -20,9 +27,11 @@ jobs:
           gradle-version: 9.1.0
 
       - name: Generate mod project
+        env:
+          MC_VERSION: ${{ matrix.mc }}
         run: |
           set -euo pipefail
-          MC=1.21.10
+          MC="${MC_VERSION}"
 
           YARN=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/yarn/${MC}" | jq -r '.[0].version') || true
           LOADER=$(curl -fsSL "https://meta.fabricmc.net/v2/versions/loader" | jq -r '[.[] | select(.stable == true)][0].version') || true
@@ -101,8 +110,8 @@ jobs:
             "id": "keymacro",
             "version": "1.0.0",
             "name": "Key Macro",
-            "description": "Mapping tombol macro lewat GUI (/macro). Tahan tombol = jalanin urutan slot hotbar + klik.",
-            "authors": ["You"],
+            "description": "Mod macro keybind: satu tombol jalanin urutan tombol lain (hotbar, klik, dll). Dibuat oleh ZHIROO.",
+            "authors": ["ZHIROO"],
             "license": "MIT",
             "environment": "client",
             "entrypoints": {
@@ -110,14 +119,41 @@ jobs:
             },
             "depends": {
               "fabricloader": ">=0.16.0",
-              "minecraft": "1.21.10",
+              "minecraft": "__MC__",
               "java": ">=21",
               "fabric-api": "*"
             }
           }
           EOF
 
+          sed -i "s/__MC__/${MC}/" src/main/resources/fabric.mod.json
+
+          cat > src/main/resources/LICENSE <<'EOF'
+          MIT License
+
+          Copyright (c) 2026 ZHIROO
+
+          Permission is hereby granted, free of charge, to any person obtaining a copy
+          of this software and associated documentation files (the "Software"), to deal
+          in the Software without restriction, including without limitation the rights
+          to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+          copies of the Software, and to permit persons to whom the Software is
+          furnished to do so, subject to the following conditions:
+
+          The above copyright notice and this permission notice shall be included in all
+          copies or substantial portions of the Software.
+
+          THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+          IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+          FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+          AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+          LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+          OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+          SOFTWARE.
+          EOF
+
           cat > src/main/java/com/example/keymacro/KeyMacroClient.java <<'EOF'
+          // Key Macro - Author: ZHIROO
           package com.example.keymacro;
 
           import net.fabricmc.api.ClientModInitializer;
@@ -153,6 +189,7 @@ jobs:
           EOF
 
           cat > src/main/java/com/example/keymacro/MacroEntry.java <<'EOF'
+          // Key Macro - Author: ZHIROO
           package com.example.keymacro;
 
           import java.util.Arrays;
@@ -207,6 +244,7 @@ jobs:
           EOF
 
           cat > src/main/java/com/example/keymacro/MacroConfig.java <<'EOF'
+          // Key Macro - Author: ZHIROO
           package com.example.keymacro;
 
           import com.google.gson.Gson;
@@ -267,6 +305,7 @@ jobs:
           EOF
 
           cat > src/main/java/com/example/keymacro/MacroKeys.java <<'EOF'
+          // Key Macro - Author: ZHIROO
           package com.example.keymacro;
 
           import java.util.HashMap;
@@ -380,6 +419,7 @@ jobs:
           EOF
 
           cat > src/main/java/com/example/keymacro/MacroRunner.java <<'EOF'
+          // Key Macro - Author: ZHIROO
           package com.example.keymacro;
 
           import net.minecraft.client.MinecraftClient;
@@ -455,6 +495,7 @@ jobs:
           EOF
 
           cat > src/main/java/com/example/keymacro/MacroScreen.java <<'EOF'
+          // Key Macro - Author: ZHIROO
           package com.example.keymacro;
 
           import net.minecraft.client.gui.DrawContext;
@@ -710,7 +751,7 @@ jobs:
                   int yb = TOP + PER_PAGE * ROW_H + 6;
                   int x0 = this.width / 2 - ROW_W / 2;
 
-                  drawCentered(context, "Key Macro", 8, 0xFFFFFFFF);
+                  drawCentered(context, "Key Macro  |  by ZHIROO", 8, 0xFFFFFFFF);
                   drawCentered(context, "Tahan tombol pemicu buat jalanin urutan langkah (nggak aktif pas ngetik / GUI kebuka)", 20, 0xFFAAAAAA);
 
                   drawAt(context, "Tombol", x0 + 2, TOP - 12, 0xFFAAAAAA);
@@ -741,9 +782,65 @@ jobs:
         working-directory: mod
         run: gradle build --no-daemon --stacktrace
 
+      - name: Prepare jar
+        env:
+          MC_VERSION: ${{ matrix.mc }}
+        run: |
+          mkdir -p dist
+          cp mod/build/libs/keymacro-1.0.0.jar "dist/keymacro-1.0.0-mc${MC_VERSION}.jar"
+
       - name: Upload mod jar
         uses: actions/upload-artifact@v4
         with:
-          name: KeyMacro-1.21.10
-          path: mod/build/libs/keymacro-1.0.0.jar
+          name: KeyMacro-${{ matrix.mc }}
+          path: dist/*.jar
           if-no-files-found: error
+
+  release:
+    needs: build
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download jars
+        uses: actions/download-artifact@v4
+        with:
+          pattern: KeyMacro-*
+          merge-multiple: true
+          path: dist
+
+      - name: List jars
+        run: ls -la dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.0
+          target_commitish: ${{ github.sha }}
+          name: "Key Macro v1.0.0 by ZHIROO"
+          make_latest: true
+          fail_on_unmatched_files: true
+          files: dist/*.jar
+          body: |
+            # Key Macro v1.0.0
+
+            Mod macro keybind (client-side, Fabric). Satu tombol bisa jalanin urutan tombol lain: hotbar, klik kiri/kanan, dan tombol lainnya, dengan jeda yang bisa diatur.
+
+            **Dibuat oleh ZHIROO**
+
+            ## Download
+            Pilih jar sesuai versi Minecraft:
+            - `keymacro-1.0.0-mc1.21.10.jar` untuk Minecraft 1.21.10
+            - `keymacro-1.0.0-mc1.21.11.jar` untuk Minecraft 1.21.11
+
+            Butuh Fabric Loader dan Fabric API.
+
+            ## Cara pakai
+            1. Ketik `/macro` di game.
+            2. Klik "+ Tambah Macro", klik kotak pertama lalu tekan tombol pemicu (misal Z).
+            3. Isi kotak langkah dengan menekan tombol (misal 3, klik kanan, 4, klik kanan).
+            4. Atur Delay (ms), lalu tahan tombol pemicu di game.
+
+            ## Credit
+            Created by **ZHIROO**. Licensed under MIT.
